@@ -20,8 +20,9 @@
  * either don't trigger the call branch or skip this pass entirely.
  */
 
-import type { ScopeId, SymbolDefinition, TypeRef } from 'gitnexus-shared';
+import type { Range, Scope, ScopeId, SymbolDefinition, TypeRef } from 'gitnexus-shared';
 import type { ElementAccessRoute, ScopeResolver } from '../contract/scope-resolver.js';
+import { simpleQualifiedName } from '../graph-bridge/ids.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { WorkspaceResolutionIndex } from '../workspace-index.js';
 import {
@@ -120,6 +121,10 @@ interface ResolveCompoundReceiverOptions {
    *  languages that hoist return-type bindings to Module scope (C#);
    *  otherwise we risk picking up unrelated module-level bindings. */
   readonly hoistTypeBindingsToModule?: boolean;
+  /** `ScopeResolver.hoistedTypeBindingsRequireOwner`: a binding found by that
+   *  walk counts only when a member of the class being asked about declared
+   *  it — see `hoistedMemberBinding`. */
+  readonly hoistedTypeBindingsRequireOwner?: boolean;
   /** `ScopeResolver.resolveThisViaEnclosingClass` — the language declares that
    *  `this` IS the enclosing class rather than a per-function-scope binding.
    *  Read only by the `this` head seed below. */
@@ -504,6 +509,116 @@ function classOfReturnType(
   return noteReceiverType(record, erasedTypeApplication(retType) ?? retType.rawName, def);
 }
 
+/** Does `inner` lie entirely inside `outer`? Positions compare line-first. */
+function rangeWithin(inner: Range, outer: Range): boolean {
+  const startsInside =
+    inner.startLine > outer.startLine ||
+    (inner.startLine === outer.startLine && inner.startCol >= outer.startCol);
+  const endsInside =
+    inner.endLine < outer.endLine ||
+    (inner.endLine === outer.endLine && inner.endCol <= outer.endCol);
+  return startsInside && endsInside;
+}
+
+/** Do `a` and `b` share at least one position? */
+function rangesOverlap(a: Range, b: Range): boolean {
+  const aEndsBeforeB =
+    a.endLine < b.startLine || (a.endLine === b.startLine && a.endCol < b.startCol);
+  const bEndsBeforeA =
+    b.endLine < a.startLine || (b.endLine === a.startLine && b.endCol < a.startCol);
+  return !aEndsBeforeB && !bEndsBeforeA;
+}
+
+/**
+ * The members, of any owner, whose declaration lies inside a hoisted binding's
+ * declaration anchor. Memoized per binding object: the answer depends only on
+ * the binding and the (already owner-populated) scope tree. Under the
+ * out-of-core scope seal a lookup can hand back a fresh object, which only
+ * costs a recomputation.
+ */
+const membersDeclaredInAnchor = new WeakMap<TypeRef, readonly SymbolDefinition[]>();
+
+function membersDeclaredIn(
+  binding: TypeRef,
+  scopes: ScopeResolutionIndexes,
+): readonly SymbolDefinition[] {
+  const memo = membersDeclaredInAnchor.get(binding);
+  if (memo !== undefined) return memo;
+  const anchor = binding.bindingRange;
+  const members: SymbolDefinition[] = [];
+  if (anchor !== undefined) {
+    // The binding's own scope encloses its declaration, so descending from it
+    // through the scopes that overlap the anchor reaches every scope that can
+    // own a member declared there (a method's Function scope, a field's Class
+    // scope, a Rust `impl` block's methods), and nothing else.
+    const pending: ScopeId[] = [binding.declaredAtScope];
+    for (let scopeId = pending.pop(); scopeId !== undefined; scopeId = pending.pop()) {
+      const scope = scopes.scopeTree.getScope(scopeId);
+      if (scope === undefined) continue;
+      for (const def of scope.ownedDefs) {
+        if (
+          def.ownerId !== undefined &&
+          def.declarationRange !== undefined &&
+          rangeWithin(def.declarationRange, anchor)
+        ) {
+          members.push(def);
+        }
+      }
+      for (const childId of scopes.scopeTree.getChildren(scopeId)) {
+        const child = scopes.scopeTree.getScope(childId);
+        if (child !== undefined && rangesOverlap(child.range, anchor)) pending.push(childId);
+      }
+    }
+  }
+  membersDeclaredInAnchor.set(binding, members);
+  return members;
+}
+
+/**
+ * A member's type binding that the language hoisted out of `classScope` onto
+ * an ancestor (Module) scope.
+ *
+ * The hoisted bindings are keyed by the bare member NAME on the Module scope,
+ * so the name alone cannot say whose they are: `class A { getUser(): User }`
+ * and `class B { getUser(): Admin }` in one file leave a single `getUser`
+ * entry (the later one), an imported top-level function of the same name lands
+ * in the same map, and a class with no such member at all still finds it.
+ * Accepting by name types `a.getUser().save()` as `Admin.save`.
+ *
+ * With `hoistedTypeBindingsRequireOwner` the join is by declaration anchor and
+ * owner instead: the binding's `bindingRange` is the declaration it came from,
+ * and a member named `memberName` declared there must be owned by `ownerId`. A
+ * binding that fails the join is skipped and the walk keeps climbing — a
+ * missing edge is recoverable, a confidently wrong one is not. Without the
+ * toggle the first binding found is taken, exactly as before.
+ */
+function hoistedMemberBinding(
+  classScope: Scope,
+  ownerId: string,
+  memberName: string,
+  scopes: ScopeResolutionIndexes,
+  options: ResolveCompoundReceiverOptions,
+): TypeRef | undefined {
+  const requireOwner = options.hoistedTypeBindingsRequireOwner === true;
+  let curId: ScopeId | null = classScope.parent;
+  while (curId !== null) {
+    const curScope = scopes.scopeTree.getScope(curId);
+    if (curScope === undefined) return undefined;
+    const hoisted = curScope.typeBindings.get(memberName);
+    if (
+      hoisted !== undefined &&
+      (!requireOwner ||
+        membersDeclaredIn(hoisted, scopes).some(
+          (member) => member.ownerId === ownerId && simpleQualifiedName(member) === memberName,
+        ))
+    ) {
+      return hoisted;
+    }
+    curId = curScope.parent;
+  }
+  return undefined;
+}
+
 function typeOfMemberOnClass(
   owner: SymbolDefinition,
   memberName: string,
@@ -543,38 +658,35 @@ function typeOfMemberOnClass(
     // without this walk the fold cannot type a single step in the first
     // language it ships for. Gated on the same contract flag
     // `resolveCompoundReceiverClass` uses, so a language that does not hoist
-    // cannot pick up an unrelated module-level binding of the same name.
-    if (classScope !== undefined && options.hoistTypeBindingsToModule === true) {
-      let curId: ScopeId | null = classScope.parent;
-      while (curId !== null) {
-        const curScope = scopes.scopeTree.getScope(curId);
-        if (curScope === undefined) break;
-        const hoisted = curScope.typeBindings.get(memberName);
-        if (hoisted !== undefined) {
-          // Same stripper the primary branch above passes. Omitting it here
-          // meant a decorated declared type (`*Host`) resolved on one branch and
-          // not the other, for the same member of the same class.
-          const def = classOfDeclaredType(
-            hoisted,
-            scopes,
-            options.stripTypePreservingDecoration,
-            options.recordReceiverType,
-            options.onNameFallback,
-          );
-          // Identical to the primary branch: a declared type that named no
-          // class is still a usable position when the next step unwraps it.
-          // Returning `undefined` here made `svc.getMap()['k'].run()` decline
-          // while byte-identical `byId['k'].run()` resolved, purely because ten
-          // languages route return-type bindings through this hoisted branch
-          // and the other through the class scope.
-          return {
-            def,
-            declaredType: hoisted.declaredSpelling ?? hoisted.rawName,
-            declaredAtScope: hoisted.declaredAtScope,
-          };
-        }
-        curId = curScope.parent;
-      }
+    // cannot pick up an unrelated module-level binding of the same name. A
+    // language that also sets `hoistedTypeBindingsRequireOwner` additionally
+    // refuses a same-named member of another class (see `hoistedMemberBinding`).
+    const hoisted =
+      classScope !== undefined && options.hoistTypeBindingsToModule === true
+        ? hoistedMemberBinding(classScope, ownerId, memberName, scopes, options)
+        : undefined;
+    if (hoisted !== undefined) {
+      // Same stripper the primary branch above passes. Omitting it here
+      // meant a decorated declared type (`*Host`) resolved on one branch and
+      // not the other, for the same member of the same class.
+      const def = classOfDeclaredType(
+        hoisted,
+        scopes,
+        options.stripTypePreservingDecoration,
+        options.recordReceiverType,
+        options.onNameFallback,
+      );
+      // Identical to the primary branch: a declared type that named no
+      // class is still a usable position when the next step unwraps it.
+      // Returning `undefined` here made `svc.getMap()['k'].run()` decline
+      // while byte-identical `byId['k'].run()` resolved, purely because ten
+      // languages route return-type bindings through this hoisted branch
+      // and the other through the class scope.
+      return {
+        def,
+        declaredType: hoisted.declaredSpelling ?? hoisted.rawName,
+        declaredAtScope: hoisted.declaredAtScope,
+      };
     }
   }
   return undefined;
@@ -1111,19 +1223,10 @@ export function resolveCompoundReceiverClass(
       // enabling it unconditionally would let other languages pick up
       // unrelated module-level bindings. See contract doc for the
       // invariant and `propagateImportedReturnTypes` for how the
-      // hoisted bindings originate.
+      // hoisted bindings originate. `hoistedMemberBinding` also applies the
+      // owner join when the language asks for it.
       if (cs !== undefined && options.hoistTypeBindingsToModule === true) {
-        let curId: ScopeId | null = cs.parent;
-        while (curId !== null) {
-          const curScope = scopes.scopeTree.getScope(curId);
-          if (curScope === undefined) break;
-          const cand = curScope.typeBindings.get(methodName);
-          if (cand !== undefined) {
-            retType = cand;
-            break;
-          }
-          curId = curScope.parent;
-        }
+        retType = hoistedMemberBinding(cs, ownerId, methodName, scopes, options);
         if (retType !== undefined) break;
       }
     }
@@ -1381,17 +1484,7 @@ export function resolveCompoundReceiverClass(
       options.hoistTypeBindingsToModule === true &&
       cs !== undefined
     ) {
-      let curId: ScopeId | null = cs.parent;
-      while (curId !== null) {
-        const curScope = scopes.scopeTree.getScope(curId);
-        if (curScope === undefined) break;
-        const cand = curScope.typeBindings.get(memberName);
-        if (cand !== undefined) {
-          memberType = cand;
-          break;
-        }
-        curId = curScope.parent;
-      }
+      memberType = hoistedMemberBinding(cs, currentClass.nodeId, memberName, scopes, options);
     }
     if (memberType === undefined) {
       // Trailing segment may be a method name without `()` — e.g.
@@ -1697,17 +1790,7 @@ function resolveMapValueTypeNameFromPrefix(
     if (cs === undefined) return undefined;
     let memberType = cs.typeBindings.get(memberName);
     if (memberType === undefined && options.hoistTypeBindingsToModule === true) {
-      let curId: ScopeId | null = cs.parent;
-      while (curId !== null) {
-        const curScope = scopes.scopeTree.getScope(curId);
-        if (curScope === undefined) break;
-        const cand = curScope.typeBindings.get(memberName);
-        if (cand !== undefined) {
-          memberType = cand;
-          break;
-        }
-        curId = curScope.parent;
-      }
+      memberType = hoistedMemberBinding(cs, currentClass.nodeId, memberName, scopes, options);
     }
     if (memberType === undefined) return undefined;
     lastMemberType = memberType;

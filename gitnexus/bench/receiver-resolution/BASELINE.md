@@ -1,5 +1,22 @@
 # Receiver-resolution baseline
 
+## Swift and Dart hoisted return types (#3498 RC2)
+
+Swift and Dart hoist every method's return-type binding onto the Module scope,
+as C# does, but neither set `hoistTypeBindingsToModule`, so a chained receiver
+such as `svc.getUser().save()` never found the type of `getUser()`. Both now set
+it. Seven shape cells flip to `RESOLVES`, each with the correct target: swift
+`plainChain`, `plainDeepChain`, `optionalChain` and `nonNullAssert` (each
+INVISIBLE-GAP before), and dart `plainChain`, `plainDeepChain` and
+`optionalChain` (each VISIBLE-GAP before). Swift `awaitParen` and dart
+`nonNullAssert` still need their own fixes.
+
+Both languages also set the new `hoistedTypeBindingsRequireOwner`. The hoisted
+bindings are keyed by bare member name, so the walk now accepts one only when a
+member of the receiver's own class declared it. Without that check, two classes
+with a same-named method in one file typed each other's chains. The count arm
+does not move, and neither does any cell in another language.
+
 ## Express inline-handler fixture (#3488)
 
 The new `express-inline-handlers` fixture reads `req.query.path` inside an
