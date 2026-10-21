@@ -1,5 +1,31 @@
 # Receiver-resolution baseline
 
+## PHP namespaced-function factory results (#3498 follow-up)
+
+PHP now types `$x = rp\make()`, `\App\Mod\make()`, `Mod\make()`,
+`namespace\make()` and the inline `rp\make()->m()` from `make`'s return type.
+The callee path is expanded through the calling file's namespace and `use`
+table to a fully qualified name, and resolved through
+`ScopeResolver.resolveQualifiedCallee`. A `use function` import that no PSR-4
+path resolves is bound to the one function with that fully qualified name. A
+receiver bound to a namespaced function with no return type
+(`$x = rp\untyped()`) is recorded as dropped rather than read as an exact
+miss.
+
+The count arm moves only by the new `php-qualified-function-factory` fixture.
+Its two untyped sites, `$x = rp\untyped(); $x->ping()` and inline
+`rp\untyped()->ping()`, are each one call drop (+2 calls; PHP captures no
+callee-position reads). Its six typed qualified forms resolve and record no
+drop. A same-corpus A/B against the parent branch (`b97d9e333`) records no
+other drop change and removes no edge. Outside the new fixture it adds four
+correct `use function` edges that the combined corpus lacked, because its
+merged composer configs map `App\` to many fixtures: php-calls
+`create_user -> write_audit`, php-overload-dispatch `run -> format_text` and
+`run -> format_text_padded`, and php-use-function-const
+`Calculator.process -> formatName`. Shape-arm cells are unchanged.
+
+Totals: call drops 154 -> 156, all kinds 224 -> 226.
+
 ## Rust module-qualified factory results (#3498 follow-up)
 
 Rust now types `let x = rp::make()`, `modx::make()`, `crate::modx::make()` and
