@@ -33,7 +33,7 @@ import type { DecodedReceiverChain } from '../../utils/receiver-chain-codec.js';
 import { decodeReceiverChain } from '../../utils/receiver-chain-codec.js';
 import type { QualifiedCalleeResolver } from './imported-return-types.js';
 import { namespaceCallReturnType, qualifiedCalleeReturnType } from './imported-return-types.js';
-import type { DecorationStripper } from '../scope/walkers.js';
+import type { ClassBindingLookup, DecorationStripper } from '../scope/walkers.js';
 import {
   findClassBindingInScope,
   lookupNameClaim,
@@ -46,6 +46,7 @@ import {
   findReceiverTypeBinding,
   isClassLike,
   isNamespaceNameShadowed,
+  moduleScopeIdOf,
 } from '../scope/walkers.js';
 
 /** Max depth for compound-receiver chain resolution (`a().b().c().d()`).
@@ -137,6 +138,9 @@ interface ResolveCompoundReceiverOptions {
    *  rather than re-declared, so a future sub-field cannot be added there
    *  and silently ignored here (#2708). */
   readonly constructionSyntax?: ScopeResolver['constructionSyntax'];
+  /** `ScopeResolver.isTypeApplicationCall`: a call whose callee names a type
+   *  constructor yields that TYPE, typed like a bare construction. */
+  readonly isTypeApplicationCall?: ScopeResolver['isTypeApplicationCall'];
   /** Verified namespace handles visible in the current file. */
   readonly namespaceTargets?: ReadonlyMap<string, readonly string[]>;
   /** A namespace member may be a name the target module imported and
@@ -187,6 +191,10 @@ interface ResolveCompoundReceiverOptions {
    *  undotted call no scope binds (`rp::make()`) from the return annotation of
    *  the callable the provider resolves it to. Absent ⇒ exactly as before. */
   readonly resolveQualifiedCallee?: QualifiedCalleeResolver;
+  /** `ScopeResolver.qualifiedTypeLookupSpelling`, tried before `rawName` by
+   *  every {@link classOfDeclaredType} caller (member, head and fold lookups).
+   *  Absent ⇒ `rawName` alone, exactly as before. */
+  readonly qualifiedTypeLookupSpelling?: ScopeResolver['qualifiedTypeLookupSpelling'];
 }
 
 /** Is this hop the language's construction selector applied to the class
@@ -224,10 +232,14 @@ function escapeForRegExp(literal: string): string {
  * `isConstructionSelectorHop` (the `Class.new` spelling), this is where the
  * rule "constructing a class yields an instance of it" lives; the
  * per-language surface syntax arrives via `constructionSyntax` (#2708).
+ * A type application (`Stack(u8)`, `isTypeApplicationCall`) names
+ * its class the same way a bare construction does: the expression is the
+ * TYPE rather than an instance, which receiver typing does not distinguish.
  *
- * Returns undefined when the language declares no construction syntax,
- * when the callee names no class-like symbol reachable from `inScope`,
- * or when the keyword is required but absent — never a guess.
+ * Returns undefined when the language declares no construction syntax and
+ * the call is no type application, when the callee names no class-like
+ * symbol reachable from `inScope`, or when the keyword is required but
+ * absent — never a guess.
  */
 function resolveConstructionExpressionClass(
   fnExpr: string,
@@ -237,7 +249,8 @@ function resolveConstructionExpressionClass(
   options: ResolveCompoundReceiverOptions,
 ): SymbolDefinition | undefined {
   const syntax = options.constructionSyntax;
-  if (syntax === undefined) return undefined;
+  const typeApplication = options.isTypeApplicationCall?.(fnExpr) === true;
+  if (syntax === undefined && !typeApplication) return undefined;
 
   let calleeName: string | undefined;
   // The keyword is separated from the type by whatever trivia the source
@@ -246,12 +259,12 @@ function resolveConstructionExpressionClass(
   // rather than by exactly one space (#2708). `newService()` keeps failing
   // the match, which is the point: it is an ordinary call.
   const keywordMatch =
-    syntax.keyword === undefined
+    syntax?.keyword === undefined
       ? null
       : new RegExp(`^${escapeForRegExp(syntax.keyword)}\\s+`).exec(fnExpr);
   if (keywordMatch !== null) {
     calleeName = fnExpr.slice(keywordMatch[0].length).trim();
-  } else if (syntax.bare === true) {
+  } else if (syntax?.bare === true || typeApplication) {
     calleeName = fnExpr;
   }
   // A `new`-keyword language reaching here without the keyword is an
@@ -304,6 +317,7 @@ function resolveConstructionExpressionClass(
     onNameFallback: options.onNameFallback,
     position: options.lookupPosition,
     purpose: 'value',
+    uniqueQualifiedNameFallback: typeApplication ? false : undefined,
   });
   if (direct !== undefined && isClassLike(direct.type)) return direct;
 
@@ -312,6 +326,7 @@ function resolveConstructionExpressionClass(
       onNameFallback: options.onNameFallback,
       position: options.lookupPosition,
       purpose: 'value',
+      uniqueQualifiedNameFallback: typeApplication ? false : undefined,
     });
     if (viaBaseName !== undefined && isClassLike(viaBaseName.type)) return viaBaseName;
   }
@@ -319,7 +334,8 @@ function resolveConstructionExpressionClass(
   // Qualified callee — `new ns.Service()` / `new Outer.Inner()`. Prefer an
   // unambiguous qualified-name match, then fall back to the trailing simple
   // name the way receiver resolution does elsewhere (#2708).
-  if (lastDot === -1) return undefined;
+  // Type-application syntax alone cannot justify a workspace-name guess.
+  if (lastDot === -1 || typeApplication) return undefined;
   const root = baseName.slice(0, baseName.indexOf('.'));
   const claim = lookupNameClaim(inScope, root, scopes, {
     position: options.lookupPosition,
@@ -437,27 +453,87 @@ interface FoldState {
  * resolves through the identical `findClassBindingInScope` call it did before
  * (`resolveClassBindingForName` tries that first, and a name with no `<`
  * returns immediately after it).
+ *
  */
 function classOfDeclaredType(
   typeRef: TypeRef,
   scopes: ScopeResolutionIndexes,
+  options: ResolveCompoundReceiverOptions,
   stripDecoration?: DecorationStripper,
-  recordReceiverType?: ReceiverTypeRecorder,
-  onNameFallback?: () => void,
 ): SymbolDefinition | undefined {
   // `declaredAtScope`, never a scope the caller chose: all five sites passed
   // exactly this `TypeRef`'s own anchor, and taking it as a parameter is what
   // would let a sixth quietly not — which is the hole this helper exists to
   // close, one level up.
+  const lookup: ClassBindingLookup = {
+    position: typeRef.lookupPosition,
+    purpose: typeRef.lookupPurpose ?? 'type',
+    onNameFallback: options.onNameFallback,
+  };
+  // The report keeps the spelling it always had, whichever lookup answers: it
+  // is read only for type ARGUMENTS (#2912), and the qualified spelling has none.
   const spelling = erasedTypeApplication(typeRef) ?? typeRef.rawName;
-  const def = resolveClassBindingForName(
-    typeRef.declaredAtScope,
-    spelling,
+  const qualified = classOfQualifiedTypeSpelling(
+    typeRef,
     scopes,
-    stripDecoration,
-    { position: typeRef.lookupPosition, purpose: typeRef.lookupPurpose ?? 'type', onNameFallback },
+    options.qualifiedTypeLookupSpelling,
+    lookup,
+    options.namespaceMemberVisible,
   );
-  return noteReceiverType(recordReceiverType, spelling, def);
+  const def =
+    qualified === undefined
+      ? resolveClassBindingForName(
+          typeRef.declaredAtScope,
+          spelling,
+          scopes,
+          stripDecoration,
+          lookup,
+        )
+      : (qualified ?? undefined);
+  return noteReceiverType(options.recordReceiverType, spelling, def);
+}
+
+/**
+ * The class a declared type's QUALIFIED spelling names (`models.User`), or
+ * `null` when that spelling cannot resolve. `undefined` means the provider
+ * supplied no qualified spelling, so the caller may try the bare name.
+ *
+ * NAMESPACE-GROUNDED ONLY. The workspace-wide unique-name fallback is off for
+ * this attempt, so a hit came from the qualifier's import (its target files,
+ * filtered by `namespaceMemberVisible`), never from a name that happens to be
+ * unique. A qualified miss is authoritative: the bare `rawName` cannot name
+ * a different package's declaration just because it is unique in the repo.
+ *
+ * FROM THE MODULE SCOPE, not from `declaredAtScope`. The hook's qualifier names
+ * a file-level import, and `declaredAtScope` is where the BINDING lives — a
+ * scope that can bind the qualifier's own name. `vault *vault.Vault` as a field,
+ * a parameter or a local is ordinary code, and asked from there the qualifier
+ * `vault` found the receiver itself rather than the import, so the namespace
+ * branch had no target files and the bare fallback refused the ambiguous name.
+ *
+ * Exported for the simple-typeBinding case in `receiver-bound-calls`, so a
+ * receiver typed through a field and one typed through a parameter cannot
+ * disagree on which package `models.User` means.
+ */
+export function classOfQualifiedTypeSpelling(
+  typeRef: TypeRef,
+  scopes: ScopeResolutionIndexes,
+  qualifiedTypeLookupSpelling: ScopeResolver['qualifiedTypeLookupSpelling'],
+  lookup: ClassBindingLookup,
+  namespaceMemberVisible: ClassBindingLookup['namespaceMemberVisible'],
+): SymbolDefinition | null | undefined {
+  // Runs for every declared-type lookup in every language, so nothing is
+  // allocated until the provider has actually returned a qualified spelling.
+  const qualified = qualifiedTypeLookupSpelling?.(typeRef);
+  if (qualified === undefined || qualified === typeRef.rawName) return undefined;
+  const importScope = moduleScopeIdOf(typeRef.declaredAtScope, scopes) ?? typeRef.declaredAtScope;
+  return (
+    findClassBindingInScope(importScope, qualified, scopes, undefined, {
+      ...lookup,
+      namespaceMemberVisible,
+      uniqueQualifiedNameFallback: false,
+    }) ?? null
+  );
 }
 
 /**
@@ -526,9 +602,8 @@ function typeOfMemberOnClass(
       const def = classOfDeclaredType(
         memberType,
         scopes,
+        options,
         options.stripTypePreservingDecoration,
-        options.recordReceiverType,
-        options.onNameFallback,
       );
       // The declared type is reported even when it resolved to no class:
       // `Promise<User>` and `[]Repo` name nothing in the workspace, and an
@@ -563,9 +638,8 @@ function typeOfMemberOnClass(
           const def = classOfDeclaredType(
             hoisted,
             scopes,
+            options,
             options.stripTypePreservingDecoration,
-            options.recordReceiverType,
-            options.onNameFallback,
           );
           // Identical to the primary branch: a declared type that named no
           // class is still a usable position when the next step unwraps it.
@@ -930,13 +1004,7 @@ export function resolveCompoundReceiverClass(
         });
       }
 
-      const viaTb = classOfDeclaredType(
-        tb,
-        scopes,
-        options.stripTypePreservingDecoration,
-        options.recordReceiverType,
-        options.onNameFallback,
-      );
+      const viaTb = classOfDeclaredType(tb, scopes, options, options.stripTypePreservingDecoration);
       if (viaTb !== undefined) return viaTb;
 
       // Member-alias / call-result shapes store the RHS path on rawName
@@ -1068,7 +1136,9 @@ export function resolveCompoundReceiverClass(
       // The constructed value IS the receiver, so there is no binding to
       // read a type off; the return-type path above cannot help either,
       // because a class has no return-type binding. Type it from the
-      // class the callee names (#2708).
+      // class the callee names (#2708). A type application (`Stack(u8)
+      // .init()`) reaches here too: its callee returns `type`, which binds
+      // nothing.
       return resolveConstructionExpressionClass(fnExpr, inScope, scopes, index, options);
     }
 
@@ -1292,13 +1362,7 @@ export function resolveCompoundReceiverClass(
   // two had a fixture. See `classOfDeclaredType` for why this cannot change a
   // `TypeRef` that was never reduced.
   let currentClass: SymbolDefinition | undefined = headType
-    ? classOfDeclaredType(
-        headType,
-        scopes,
-        undefined,
-        options.recordReceiverType,
-        options.onNameFallback,
-      )
+    ? classOfDeclaredType(headType, scopes, options)
     : findClassBindingInScope(inScope, headMemberName, scopes, undefined, {
         onNameFallback: options.onNameFallback,
         position: options.lookupPosition,
@@ -1454,13 +1518,7 @@ export function resolveCompoundReceiverClass(
     // grounds fell through here — a declined fold is documented as "no answer",
     // never a veto — and this walk re-minted `other.py:Mapped` from the
     // workspace index. Same rule, same lookup, so the two routes now agree.
-    let nextClass = classOfDeclaredType(
-      memberType,
-      scopes,
-      undefined,
-      options.recordReceiverType,
-      options.onNameFallback,
-    );
+    let nextClass = classOfDeclaredType(memberType, scopes, options);
     if (nextClass === undefined) {
       const fromMap = unwrapMapValueToClass(memberType, scopes, options.onNameFallback);
       if (fromMap !== undefined) nextClass = fromMap;

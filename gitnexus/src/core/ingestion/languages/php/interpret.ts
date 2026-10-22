@@ -126,10 +126,12 @@ export function interpretPhpTypeBinding(captures: CaptureMatch): ParsedTypeBindi
     // For callable/class names, `normalizePhpType` strips qualifiers correctly.
     const rawText = typeCap.text.trim();
     if (captures['@type-binding.qualified-callee'] !== undefined) {
-      // `$u = rp\make()`: the callee path verbatim, for the provider's
+      // `$u = rp\make()`: preserve the callee path for the provider's
       // `resolveQualifiedCallee` (#3498). `normalizePhpType` would strip the
       // `\` that makes `\App\make` absolute, leaving the relative `App\make`.
-      rawType = PHP_CALLEE_PATH_RE.test(rawText) ? rawText : null;
+      // A function and class may share this path. Keep call-result provenance
+      // so class lookup cannot consume the callee as an annotation.
+      rawType = PHP_CALLEE_PATH_RE.test(rawText) ? `${rawText}()` : null;
     } else if (rawText.startsWith('$')) {
       // Variable alias: keep as-is for chain-following.
       rawType = rawText;

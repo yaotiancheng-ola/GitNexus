@@ -26,6 +26,10 @@ import type {
   SymbolDefinition,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+import { ParseTimeoutError, parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
+import { logger } from '../../../logger.js';
+import type { PhpSiblingInputs } from './namespace-siblings.js';
+import { getPhpParser } from './query.js';
 
 /** What PHP name resolution reads off the calling file. */
 export interface PhpNameContext {
@@ -42,6 +46,8 @@ interface PhpFunctionIndex {
   readonly contextByFile: ReadonlyMap<string, PhpNameContext>;
   /** Lower-cased fully qualified name → every `Function` def declaring it. */
   readonly functionsByFqn: ReadonlyMap<string, readonly SymbolDefinition[]>;
+  /** Namespace ownership could not be recovered for these named declarations. */
+  readonly unownedNames: ReadonlySet<string>;
 }
 
 /** Keyed by the pass's indexes, so concurrent or stale passes never mix. */
@@ -86,34 +92,117 @@ export function phpFunctionFqn(calleeText: string, context: PhpNameContext): str
 /**
  * Record each file's name context and index every function by fully qualified
  * name for this pass. Called once namespaces are known
- * (`populatePhpNamespaceSiblings`); a file whose namespace is unknown, or that
- * declares several namespaces (the single namespace recorded for it would be
- * wrong for some of its declarations), contributes nothing and resolves nothing.
+ * (`populatePhpNamespaceSiblings`). Multi-namespace files contribute declarations
+ * under their actual namespaces, but remain unsupported as calling contexts.
  */
 export function recordPhpFunctionIndex(
   parsedFiles: readonly ParsedFile[],
   indexes: ScopeResolutionIndexes,
   namespaceByFile: ReadonlyMap<string, string>,
+  inputs: PhpSiblingInputs,
 ): void {
   const contextByFile = new Map<string, PhpNameContext>();
   const functionsByFqn = new Map<string, SymbolDefinition[]>();
+  const unownedNames = new Set<string>();
   for (const parsed of parsedFiles) {
     const namespace = namespaceByFile.get(parsed.filePath);
     if (namespace === undefined) continue;
-    if (parsed.scopes.filter((scope) => scope.kind === 'Namespace').length > 1) continue;
-    contextByFile.set(parsed.filePath, { namespace, imports: parsed.parsedImports });
+    const multipleNamespaces =
+      parsed.scopes.filter((scope) => scope.kind === 'Namespace').length > 1;
+    const declarationNamespaces = multipleNamespaces
+      ? functionNamespaces(parsed, inputs)
+      : undefined;
+    if (!multipleNamespaces)
+      contextByFile.set(parsed.filePath, { namespace, imports: parsed.parsedImports });
     for (const def of parsed.localDefs) {
       if (def.type !== 'Function') continue;
       const name = (def.qualifiedName ?? '').split('\\').at(-1) ?? '';
       // A closure bound to `$handler` is a Function def no path can name.
       if (!IDENTIFIER_RE.test(name)) continue;
-      const key = within(namespace, name).toLowerCase();
+      if (multipleNamespaces && declarationNamespaces === undefined) {
+        unownedNames.add(name.toLowerCase());
+        continue;
+      }
+      const declaredNamespace =
+        declarationNamespaces?.get(def.nodeId) ?? (multipleNamespaces ? undefined : namespace);
+      if (declaredNamespace === undefined) continue;
+      const key = within(declaredNamespace, name).toLowerCase();
       const defs = functionsByFqn.get(key);
       if (defs === undefined) functionsByFqn.set(key, [def]);
       else defs.push(def);
     }
   }
-  indexByPass.set(indexes, { contextByFile, functionsByFqn });
+  indexByPass.set(indexes, { contextByFile, functionsByFqn, unownedNames });
+}
+
+/** Only multi-namespace files need declaration-specific source ownership. */
+function functionNamespaces(
+  parsed: ParsedFile,
+  inputs: PhpSiblingInputs,
+): ReadonlyMap<string, string> | undefined {
+  const content = inputs.fileContents.get(parsed.filePath);
+  const result = new Map<string, string>();
+  if (content === undefined) return undefined;
+  const cached = inputs.treeCache?.get(parsed.filePath);
+  let tree: ReturnType<typeof parseSourceSafe>;
+  try {
+    tree = (cached ??
+      parseSourceSafe(
+        getPhpParser(),
+        content,
+        undefined,
+        undefined,
+        parsed.filePath,
+      )) as ReturnType<typeof parseSourceSafe>;
+  } catch (error) {
+    if (!(error instanceof ParseTimeoutError)) throw error;
+    logger.warn(
+      { file: parsed.filePath },
+      'PHP namespace parse timed out; named functions remain ambiguous',
+    );
+    return undefined;
+  }
+  const declarations = tree.rootNode.namedChildren.filter(
+    (node) => node.type === 'namespace_definition',
+  );
+  const regions = declarations.map((node, index) => {
+    const end =
+      node.childForFieldName('body') === null
+        ? (declarations[index + 1]?.startPosition ?? tree.rootNode.endPosition)
+        : node.endPosition;
+    return {
+      namespace: node.childForFieldName('name')?.text ?? '',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+      endLine: end.row + 1,
+      endColumn: end.column,
+    };
+  });
+  for (const def of parsed.localDefs) {
+    if (def.type !== 'Function') continue;
+    const at = def.declarationRange ?? def.nameRange;
+    if (at === undefined) continue;
+    let low = 0;
+    let high = regions.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      const region = regions[mid]!;
+      if (
+        region.line < at.startLine ||
+        (region.line === at.startLine && region.column <= at.startCol)
+      )
+        low = mid + 1;
+      else high = mid;
+    }
+    const region = regions[low - 1];
+    if (
+      region !== undefined &&
+      (at.startLine < region.endLine ||
+        (at.startLine === region.endLine && at.startCol < region.endColumn))
+    )
+      result.set(def.nodeId, region.namespace);
+  }
+  return result;
 }
 
 /**
@@ -129,6 +218,9 @@ export function resolvePhpQualifiedCallee(
 ): SymbolDefinition | undefined {
   // Asked about every name the shared sites fail to resolve: refuse cheaply.
   if (!calleeText.includes('\\')) return undefined;
+  // Type bindings mark an invoked function with (); reference sites carry
+  // only the path. Both resolve through the same function namespace.
+  if (calleeText.endsWith('()')) calleeText = calleeText.slice(0, -2);
   const index = indexByPass.get(scopes);
   const filePath = scopes.scopeTree.getScope(inScope)?.filePath;
   if (index === undefined || filePath === undefined) return undefined;
@@ -140,6 +232,7 @@ export function resolvePhpQualifiedCallee(
 
 /** The one function declaring `fqn`, or `undefined` when none or several do. */
 function uniqueFunction(fqn: string, index: PhpFunctionIndex): SymbolDefinition | undefined {
+  if (index.unownedNames.has(fqn.slice(fqn.lastIndexOf('\\') + 1).toLowerCase())) return undefined;
   const defs = index.functionsByFqn.get(fqn.toLowerCase());
   return defs?.length === 1 ? defs[0] : undefined;
 }

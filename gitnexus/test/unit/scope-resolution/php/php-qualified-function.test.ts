@@ -7,11 +7,17 @@
  * survives on the call site and the result binding) and the expansion to a fully
  * qualified name (PHP manual, "Name resolution rules").
  */
-import { describe, expect, it } from 'vitest';
-import type { ParsedImport } from 'gitnexus-shared';
+import { describe, expect, it, vi } from 'vitest';
+import type { ParsedImport, ScopeId } from 'gitnexus-shared';
 import { extractParsedFile } from '../../../../src/core/ingestion/scope-extractor-bridge.js';
 import { phpProvider } from '../../../../src/core/ingestion/languages/php.js';
-import { phpFunctionFqn } from '../../../../src/core/ingestion/languages/php/qualified-function.js';
+import {
+  phpFunctionFqn,
+  recordPhpFunctionIndex,
+  resolvePhpQualifiedCallee,
+} from '../../../../src/core/ingestion/languages/php/qualified-function.js';
+import type { ScopeResolutionIndexes } from '../../../../src/core/ingestion/model/scope-resolution-indexes.js';
+import * as safeParse from '../../../../src/core/tree-sitter/safe-parse.js';
 
 const use = (
   localName: string,
@@ -24,6 +30,47 @@ const use = (
   alias: localName,
   targetRaw,
   importedSymbolKind,
+});
+
+describe('PHP function ambiguity after a secondary parse timeout', () => {
+  it('retains possible duplicates instead of selecting the remaining function', () => {
+    const contents = new Map([
+      ['known.php', '<?php namespace Ns; function make() {}'],
+      ['multi.php', '<?php namespace Ns { function make() {} } namespace Other {}'],
+      ['caller.php', '<?php function caller() {}'],
+    ]);
+    const parsed = [...contents].map(([file, source]) => {
+      const value = extractParsedFile(phpProvider, source, file);
+      if (value === undefined) throw new Error(`parse failed: ${file}`);
+      return value;
+    });
+    const scopes = new Map(
+      parsed.flatMap((file) => file.scopes.map((scope) => [scope.id, scope] as const)),
+    );
+    const indexes = {
+      scopeTree: { getScope: (id: ScopeId) => scopes.get(id) },
+    } as unknown as ScopeResolutionIndexes;
+    const parse = vi.spyOn(safeParse, 'parseSourceSafe').mockImplementationOnce(() => {
+      throw new safeParse.ParseTimeoutError(1, 'multi.php');
+    });
+    try {
+      recordPhpFunctionIndex(
+        parsed,
+        indexes,
+        new Map([
+          ['known.php', 'Ns'],
+          ['multi.php', 'Ns'],
+          ['caller.php', ''],
+        ]),
+        { fileContents: contents },
+      );
+      const caller = parsed.find((file) => file.filePath === 'caller.php');
+      if (caller === undefined) throw new Error('caller missing');
+      expect(resolvePhpQualifiedCallee('\\Ns\\make', caller.moduleScope, indexes)).toBeUndefined();
+    } finally {
+      parse.mockRestore();
+    }
+  });
 });
 
 describe('phpFunctionFqn', () => {
@@ -62,7 +109,7 @@ describe('PHP qualified function-call captures', () => {
     ['rp\\make()', 'rp\\make'],
     ['\\Qff\\Mod\\make()', '\\Qff\\Mod\\make'],
     ['namespace\\make()', 'namespace\\make'],
-  ])('keeps the whole callee path of %s on the call site and the result binding', (call, path) => {
+  ])('keeps the callee path of %s and marks the binding as a call result', (call, path) => {
     const parsed = extractParsedFile(
       phpProvider,
       `<?php\nnamespace Qff\\App;\nfunction caller() { $x = ${call}; }\n`,
@@ -76,6 +123,6 @@ describe('PHP qualified function-call captures', () => {
       .flatMap((scope) => [...scope.typeBindings])
       .filter(([name]) => name === '$x')
       .map(([, ref]) => ref.rawName);
-    expect(bound).toEqual([path]);
+    expect(bound).toEqual([call]);
   });
 });

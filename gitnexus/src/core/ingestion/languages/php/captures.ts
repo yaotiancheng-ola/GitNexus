@@ -320,8 +320,13 @@ export function emitPhpScopeCaptures(
     const callTag = (
       ['@reference.call.free', '@reference.call.member', '@reference.call.constructor'] as const
     ).find((t) => grouped[t] !== undefined);
-    if (callTag !== undefined) {
-      const possibleFirstClass = nodeIfType(nodeMap[callTag], 'function_call_expression');
+    if (callTag !== undefined || grouped['@type-binding.alias'] !== undefined) {
+      const possibleFirstClass =
+        callTag !== undefined
+          ? nodeIfType(nodeMap[callTag], 'function_call_expression')
+          : nodeIfType(nodeMap['@type-binding.alias'], 'assignment_expression')?.childForFieldName(
+              'right',
+            );
       const argumentsNode = possibleFirstClass?.childForFieldName('arguments');
       if (
         argumentsNode?.namedChildren.some(
