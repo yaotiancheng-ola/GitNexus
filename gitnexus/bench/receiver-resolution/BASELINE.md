@@ -962,3 +962,7 @@ Re-measured both benchmark arms after merging the Zig receiver fix from main.
 Shape states remain unchanged; counts are 133 call drops and
 160 drops of all kinds (27 reads,
 0 writes). The counts include both main and this branch's fixes.
+
+### Nullable field ownership controls
+
+The nullable-field capture carries a field-specific marker. Its interpreter removes only the nullable suffix, retaining the written qualifier and generic wrapper instead of treating a wrapper as its argument. Two native controls fail before this correction (External.User? borrowing the local User, and Custom.List<User>? borrowing User) and pass after it; the local User? field remains resolved. All 273 C# resolver, capture, hook and ownership tests pass, as do both TypeScript configurations and the receiver benchmark. This changes no shape or count relative to the preceding nullable-field candidate.
