@@ -15,7 +15,7 @@
  * `@testable import X` and Swift 5.9 `package` access both still require the
  * import, so the rule below covers them; access levels are not modeled.
  * Without workspace modules (hand-built configs), the module is approximated
- * by its `Sources/<Target>/…` or `src/<Target>/…` directory.
+ * by its `Sources/<Target>/…`, `src/<Target>/…`, or `packages/<Pod>/…` directory.
  *
  * The `private` / `fileprivate` half of the rule is NOT implemented, because
  * neither marker is recoverable from the parse model this hook sees —
@@ -34,13 +34,14 @@ import {
 } from './target-grouping.js';
 
 /** Path-heuristic layouts, used only when the config carries no modules. */
-const SWIFT_TARGET_ROOTS: ReadonlySet<string> = new Set(['Sources', 'src']);
+const SWIFT_TARGET_ROOTS: ReadonlySet<string> = new Set(['Sources', 'src', 'packages']);
 
 /**
  * The module (target) a Swift file belongs to.
  *
- * `Sources/Core/User.swift` → `Core`. Arbitrary Xcode folders are not module
- * boundaries; without a recognized target layout leave the answer unknown.
+ * `Sources/Core/User.swift` → `Core`. `packages/MSVideoRoom/…` → `packages/MSVideoRoom`.
+ * Arbitrary Xcode folders are not module boundaries; without a recognized
+ * target layout leave the answer unknown.
  */
 function swiftModuleOf(filePath: string): string {
   const segments = filePath.split('/').filter((s) => s !== '');

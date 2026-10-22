@@ -1542,7 +1542,9 @@ async function inferSwiftDirectoryTargets(
   packageDir = '',
 ): Promise<Map<string, string>> {
   const targets = new Map<string, string>();
-  const sourceDirs = ['Sources', 'Source', 'Package/Sources', 'src', 'srcs'];
+  // `packages/<Pod>` is one CocoaPods module. Without it, a pod monorepo
+  // has no root Sources/ and every Swift file shares `__default__`.
+  const sourceDirs = ['Sources', 'Source', 'Package/Sources', 'src', 'srcs', 'packages'];
   for (const sourceDir of sourceDirs) {
     try {
       const fullPath = path.join(repoRoot, packageDir, sourceDir);
