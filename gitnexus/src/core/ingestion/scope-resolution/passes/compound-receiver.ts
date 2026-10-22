@@ -1006,10 +1006,12 @@ export function resolveCompoundReceiverClass(
 
       const viaTb = classOfDeclaredType(tb, scopes, options, options.stripTypePreservingDecoration);
       if (viaTb !== undefined) return viaTb;
+      const valueInferred =
+        tb.source === 'constructor-inferred' || tb.source === 'assignment-inferred';
 
       // Member-alias / call-result shapes store the RHS path on rawName
       // (`user.address`, `addr.getCity`) — resolve as a compound chain.
-      if (tb.rawName.includes('.') && !tb.rawName.includes('(')) {
+      if (valueInferred && tb.rawName.includes('.') && !tb.rawName.includes('(')) {
         const dotted = resolveCompoundReceiverClass(
           tb.rawName,
           tb.declaredAtScope,
@@ -1031,7 +1033,7 @@ export function resolveCompoundReceiverClass(
       }
 
       // Callable alias (`const user = getUser()` → type rawName `getUser`)
-      if (!tb.rawName.includes('.') && !tb.rawName.includes('(')) {
+      if (valueInferred && !tb.rawName.includes('.') && !tb.rawName.includes('(')) {
         const callAlias = resolveCompoundReceiverClass(
           `${tb.rawName}()`,
           tb.declaredAtScope,
@@ -1048,7 +1050,7 @@ export function resolveCompoundReceiverClass(
       // Recurse into the compound resolver with the raw compound
       // expression so the mixed-chain parser can split at top-level
       // `.` and resolve the receiver + method return type.
-      if (tb.rawName.includes('.') && tb.rawName.includes('(')) {
+      if (valueInferred && tb.rawName.includes('.') && tb.rawName.includes('(')) {
         const compound = resolveCompoundReceiverClass(
           tb.rawName,
           tb.declaredAtScope,
@@ -1120,6 +1122,7 @@ export function resolveCompoundReceiverClass(
           inScope,
           scopes,
           options.resolveQualifiedCallee,
+          workingText.slice(openIdx + 1, -1),
         );
         const viaQualified =
           returned === undefined

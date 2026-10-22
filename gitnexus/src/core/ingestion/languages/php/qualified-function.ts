@@ -48,6 +48,8 @@ interface PhpFunctionIndex {
   readonly functionsByFqn: ReadonlyMap<string, readonly SymbolDefinition[]>;
   /** Namespace ownership could not be recovered for these named declarations. */
   readonly unownedNames: ReadonlySet<string>;
+  /** Known function identity, but no trustworthy scope for its return annotation. */
+  readonly unownedProducerIds: ReadonlySet<string>;
 }
 
 /** Keyed by the pass's indexes, so concurrent or stale passes never mix. */
@@ -104,22 +106,25 @@ export function recordPhpFunctionIndex(
   const contextByFile = new Map<string, PhpNameContext>();
   const functionsByFqn = new Map<string, SymbolDefinition[]>();
   const unownedNames = new Set<string>();
+  const unownedProducerIds = new Set<string>();
   for (const parsed of parsedFiles) {
-    const namespace = namespaceByFile.get(parsed.filePath);
-    if (namespace === undefined) continue;
+    if (!namespaceByFile.has(parsed.filePath)) continue;
     const multipleNamespaces =
       parsed.scopes.filter((scope) => scope.kind === 'Namespace').length > 1;
+    const namespace = multipleNamespaces
+      ? namespaceByFile.get(parsed.filePath)
+      : singleNamespaceFromScope(parsed, inputs);
     const declarationNamespaces = multipleNamespaces
       ? functionNamespaces(parsed, inputs)
       : undefined;
-    if (!multipleNamespaces)
+    if (!multipleNamespaces && namespace !== undefined)
       contextByFile.set(parsed.filePath, { namespace, imports: parsed.parsedImports });
     for (const def of parsed.localDefs) {
       if (def.type !== 'Function') continue;
       const name = (def.qualifiedName ?? '').split('\\').at(-1) ?? '';
       // A closure bound to `$handler` is a Function def no path can name.
       if (!IDENTIFIER_RE.test(name)) continue;
-      if (multipleNamespaces && declarationNamespaces === undefined) {
+      if ((multipleNamespaces && declarationNamespaces === undefined) || namespace === undefined) {
         unownedNames.add(name.toLowerCase());
         continue;
       }
@@ -127,12 +132,31 @@ export function recordPhpFunctionIndex(
         declarationNamespaces?.get(def.nodeId) ?? (multipleNamespaces ? undefined : namespace);
       if (declaredNamespace === undefined) continue;
       const key = within(declaredNamespace, name).toLowerCase();
+      if (multipleNamespaces) unownedProducerIds.add(def.nodeId);
       const defs = functionsByFqn.get(key);
       if (defs === undefined) functionsByFqn.set(key, [def]);
       else defs.push(def);
     }
   }
-  indexByPass.set(indexes, { contextByFile, functionsByFqn, unownedNames });
+  indexByPass.set(indexes, { contextByFile, functionsByFqn, unownedNames, unownedProducerIds });
+}
+
+/** Scope anchors identify the actual header even when an uncached scanner misses it. */
+function singleNamespaceFromScope(
+  parsed: ParsedFile,
+  inputs: PhpSiblingInputs,
+): string | undefined {
+  const scope = parsed.scopes.find((candidate) => candidate.kind === 'Namespace');
+  if (scope === undefined) return '';
+  const content = inputs.fileContents.get(parsed.filePath);
+  if (content === undefined) return undefined;
+  const header = content
+    .split('\n')
+    .slice(scope.range.startLine - 1)
+    .join('\n')
+    .slice(scope.range.startCol);
+  const match = /^namespace(?:\s+([A-Za-z_][\w\\]*))?\s*[;{]/i.exec(header);
+  return match === null ? undefined : (match[1] ?? '');
 }
 
 /** Only multi-namespace files need declaration-specific source ownership. */
@@ -215,7 +239,10 @@ export function resolvePhpQualifiedCallee(
   calleeText: string,
   inScope: ScopeId,
   scopes: ScopeResolutionIndexes,
+  argumentsText?: string,
 ): SymbolDefinition | undefined {
+  // First-class callable creation is a Closure, not the function's result.
+  if (argumentsText !== undefined && isCallableCreationArguments(argumentsText)) return undefined;
   // Asked about every name the shared sites fail to resolve: refuse cheaply.
   if (!calleeText.includes('\\')) return undefined;
   // Type bindings mark an invoked function with (); reference sites carry
@@ -230,11 +257,32 @@ export function resolvePhpQualifiedCallee(
   return fqn === undefined ? undefined : uniqueFunction(fqn, index);
 }
 
+/** A sole placeholder token, allowing comments and whitespace around it. */
+function isCallableCreationArguments(text: string): boolean {
+  let cursor = 0;
+  let placeholder = false;
+  while (cursor < text.length) {
+    if (/\s/.test(text[cursor]!)) cursor++;
+    else if (text.startsWith('/*', cursor)) {
+      const end = text.indexOf('*/', cursor + 2);
+      if (end < 0) return false;
+      cursor = end + 2;
+    } else if (text.startsWith('//', cursor) || text[cursor] === '#') {
+      while (cursor < text.length && text[cursor] !== '\r' && text[cursor] !== '\n') cursor++;
+    } else if (!placeholder && text.startsWith('...', cursor)) {
+      placeholder = true;
+      cursor += 3;
+    } else return false;
+  }
+  return placeholder;
+}
+
 /** The one function declaring `fqn`, or `undefined` when none or several do. */
 function uniqueFunction(fqn: string, index: PhpFunctionIndex): SymbolDefinition | undefined {
   if (index.unownedNames.has(fqn.slice(fqn.lastIndexOf('\\') + 1).toLowerCase())) return undefined;
   const defs = index.functionsByFqn.get(fqn.toLowerCase());
-  return defs?.length === 1 ? defs[0] : undefined;
+  const def = defs?.length === 1 ? defs[0] : undefined;
+  return def !== undefined && !index.unownedProducerIds.has(def.nodeId) ? def : undefined;
 }
 
 /**

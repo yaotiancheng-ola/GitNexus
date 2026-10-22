@@ -33,6 +33,39 @@ const use = (
 });
 
 describe('PHP function ambiguity after a secondary parse timeout', () => {
+  it.each([
+    '<?php /* first */ /* éé second */ namespace Real; function make() {}',
+    '<?php /* header\n */ namespace Real;\nfunction make() {}',
+    '<?php declare(strict_types=1); /* header */\nnamespace\nReal;\nfunction make() {}',
+  ])('reads the parsed namespace when the scanner reported global: %j', (source) => {
+    const contents = new Map([
+      ['library.php', source],
+      ['caller.php', '<?php function caller() {}'],
+    ]);
+    const parsed = [...contents].map(
+      ([file, source]) => extractParsedFile(phpProvider, source, file)!,
+    );
+    const scopes = new Map(
+      parsed.flatMap((file) => file.scopes.map((scope) => [scope.id, scope] as const)),
+    );
+    const indexes = {
+      scopeTree: { getScope: (id: ScopeId) => scopes.get(id) },
+    } as unknown as ScopeResolutionIndexes;
+    recordPhpFunctionIndex(
+      parsed,
+      indexes,
+      new Map([
+        ['library.php', ''],
+        ['caller.php', ''],
+      ]),
+      { fileContents: contents },
+    );
+    const inScope = parsed[1]!.moduleScope;
+    expect(resolvePhpQualifiedCallee('\\make', inScope, indexes)).toBeUndefined();
+    expect(resolvePhpQualifiedCallee('\\Real\\make', inScope, indexes)?.filePath).toBe(
+      'library.php',
+    );
+  });
   it('retains possible duplicates instead of selecting the remaining function', () => {
     const contents = new Map([
       ['known.php', '<?php namespace Ns; function make() {}'],
