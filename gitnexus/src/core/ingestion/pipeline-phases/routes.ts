@@ -554,7 +554,11 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
           while ((match = pattern.exec(content)) !== null) {
             const url = match[2] ?? match[1];
             if (url && url.startsWith('/')) {
-              allFetchCalls.push({ filePath, fetchURL: url, lineNumber: 0 });
+              // 0-based like the AST sites, so the navigation call is attributed
+              // to the component that contains it rather than to whatever spans
+              // line 0.
+              const lineNumber = content.slice(0, match.index).split('\n').length - 1;
+              allFetchCalls.push({ filePath, fetchURL: url, lineNumber });
             }
           }
         }
@@ -574,8 +578,9 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
     if (routeRegistry.size > 0 && wrapperCalls.length > 0) {
       const wrappers = buildFetchWrapperIndex(allFetchWrapperDefs ?? [], configuredWrappers);
       for (const call of wrapperCalls) {
-        if (wrappers.isWrapperCall(call)) allFetchCalls.push(call);
-        else unprovenCalls.push(call);
+        const urls = wrappers.urlsForCall(call);
+        if (urls.length === 0 && !wrappers.isWrapperCall(call)) unprovenCalls.push(call);
+        for (const fetchURL of urls) allFetchCalls.push({ ...call, fetchURL });
       }
     }
 

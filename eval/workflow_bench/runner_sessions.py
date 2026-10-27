@@ -36,7 +36,10 @@ USAGE_FIELDS = (
     "cache_read_input_tokens",
     "output_tokens",
 )
-MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
+# A successful 142-turn release session exceeded 8 MiB (#3500, run
+# 40181565589). Keep capture, redacted artifacts, and reuse bounded together,
+# with headroom for verbose tool results in the three concurrent paid cells.
+MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
 # Wall-clock ceiling for one headless session, shared by the runner and the
 # evolution loop so both CLIs kill a session at the same point. 3600s was too
 # tight for the `workflow` arm: run 29907431284 lost two investigation-task
@@ -643,6 +646,7 @@ def _session_result(events: list[dict[str, Any]], duration_s: float) -> tuple[di
     turns = 0
     cost = 0.0
     result_ids: set[str] = set()
+    pending_notifications: deque[int] = deque()
     previous_index = -1
     for index in indexes:
         result = events[index]
@@ -668,27 +672,25 @@ def _session_result(events: list[dict[str, Any]], duration_s: float) -> tuple[di
         segment = events[previous_index + 1 : index]
         if any(event.get("session_id", session_id) != session_id for event in segment):
             raise ValueError("background continuation changed session identity")
+        pending_notifications.extend(
+            previous_index + 1 + i
+            for i, event in enumerate(segment)
+            if event.get("type") == "system" and event.get("subtype") == "task_notification"
+        )
         if previous_index >= 0:
-            # Reject duplicate/replayed results and unrelated continuations.
-            # A task notification must precede a fresh foreground init and reply.
-            notification = next(
-                (
-                    i
-                    for i, e in enumerate(segment)
-                    if e.get("type") == "system" and e.get("subtype") == "task_notification"
-                ),
-                None,
-            )
+            # The CLI can announce completion before the preceding result.
+            # Consume each pending notification only once, before a fresh turn.
             init = next(
                 (i for i, e in enumerate(segment) if e.get("type") == "system" and e.get("subtype") == "init"), None
             )
             if (
-                notification is None
+                not pending_notifications
                 or init is None
-                or notification >= init
+                or pending_notifications[0] >= previous_index + 1 + init
                 or not any(e.get("type") == "assistant" for e in segment[init + 1 :])
             ):
                 raise ValueError("additional result lacks a background completion turn")
+            pending_notifications.popleft()
         for field in USAGE_FIELDS:
             total_usage[field] += usage[field]
         turns += count

@@ -280,7 +280,7 @@ jobs:
           node-version: '22.18.0'
           cache: npm
           cache-dependency-path: candidate/gitnexus/package-lock.json
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: '0.11.23'
           python-version: '3.13'
@@ -294,7 +294,7 @@ jobs:
         run: |
           uv run --locked --extra dev python -m workflow_bench.pr_evaluation baseline \
             --repo "$GITHUB_REPOSITORY" --run-id "$COMPARISON_RUN_ID" \
-            --harness-sha "$GITHUB_SHA" --model "$MODEL" --effort "$EFFORT" \
+            --harness-sha "$GITHUB_SHA" --env-out "$GITHUB_ENV" \
             --out "$RUNNER_TEMP/release-evaluation/previous.json"
       # Both runtimes grade the pinned task source against one dependency tree
       # built from that commit's lockfile, never the runtime under test's.

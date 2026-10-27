@@ -7,15 +7,17 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { isBuiltin } from 'node:module';
 import type Parser from 'tree-sitter';
 import { unboundCallableName } from './typescript/unbound-callables.js';
 import type { CaptureMatch, NodeLabel, ParsedFile } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
-import { createClassExtractor } from '../class-extractors/generic.js';
 import {
   typescriptClassConfig,
   javascriptClassConfig,
+  resolveTsJsContainerTypeOwner,
+  createTsJsClassExtractor,
 } from '../class-extractors/configs/typescript-javascript.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import {
@@ -402,6 +404,34 @@ export const BUILT_INS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Host objects a JavaScript runtime supplies as globals, for
+ * `LanguageProvider.externalReceiverNames`: a dropped receiver rooted at one
+ * (`document.body.appendChild`, `process.env.API_BASE`,
+ * `Buffer.from(raw).toString()`) reached code no index contains.
+ *
+ * Separate from `BUILT_INS`, which also filters CALLEE names out of the call
+ * graph — `process` there would drop every call to a program function named
+ * `process`. Here a name counts only when the program binds nothing by it at
+ * the site and declares nothing by it anywhere, so a `document` parameter or a
+ * module-level `function process()` keeps the receiver hedged.
+ *
+ * Host objects only, and only ones an application does not name its own
+ * values after: `location`, `history`, `self` and `crypto` are ordinary local
+ * names, and reaching them through `window` is already covered.
+ */
+export const EXTERNAL_RECEIVER_NAMES: ReadonlySet<string> = new Set([
+  // Browser host.
+  'window',
+  'document',
+  'navigator',
+  'localStorage',
+  'sessionStorage',
+  // Node host.
+  'process',
+  'Buffer',
+]);
+
+/**
  * `this` is the only receiver keyword JavaScript and TypeScript bind, and it
  * is bound by every function form except an arrow (#2701). The query files
  * tag those forms with `@receiver-owner.this`; this hook just reads the tag,
@@ -495,13 +525,16 @@ export const typescriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(typescriptVariableConfig),
   definitionPropertiesExtractor: extractConvexEndpointProperties,
-  classExtractor: createClassExtractor(typescriptClassConfig),
+  classExtractor: createTsJsClassExtractor(typescriptClassConfig),
+  resolveContainerTypeOwner: resolveTsJsContainerTypeOwner,
   // ── JSDoc → description (issue #2270). An exported decl is captured as the
   //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
   descriptionExtractor: createLeadingDocDescriptionExtractor({
     wrapperNodeTypes: ['export_statement'],
   }),
   builtInNames: BUILT_INS,
+  externalReceiverNames: EXTERNAL_RECEIVER_NAMES,
+  isExternalModuleSpecifier: isBuiltin,
 
   // Member-assignment shapes are not free functions (#2723 follow-up). The
   // capture arrives anchored on the assignment, so the shape is decided from
@@ -596,13 +629,16 @@ export const javascriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(javascriptVariableConfig),
   definitionPropertiesExtractor: extractConvexEndpointProperties,
-  classExtractor: createClassExtractor(javascriptClassConfig),
+  classExtractor: createTsJsClassExtractor(javascriptClassConfig),
+  resolveContainerTypeOwner: resolveTsJsContainerTypeOwner,
   // ── JSDoc → description (issue #2270). An exported decl is captured as the
   //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
   descriptionExtractor: createLeadingDocDescriptionExtractor({
     wrapperNodeTypes: ['export_statement'],
   }),
   builtInNames: BUILT_INS,
+  externalReceiverNames: EXTERNAL_RECEIVER_NAMES,
+  isExternalModuleSpecifier: isBuiltin,
 
   // Member-assignment shapes — see the TypeScript provider above.
   labelOverride: (functionNode, defaultLabel) =>

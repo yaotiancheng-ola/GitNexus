@@ -228,10 +228,19 @@ are disabled in the no-tool arm, and repository/plugin hooks are disabled in
 both arms. It fails closed when Bubblewrap is unavailable. It retains the repository source and
 ordinary test dependencies required by the tasks; rebuilding tools from that
 source is not prevented. The comparison therefore measures access to the
-provided GitNexus tools and their readable compiled runtime on these GitNexus
-development tasks. That runtime can contain later fixes absent from a task's
-historical base, so the comparison cannot isolate tool assistance from access
-to those implementations.
+provided GitNexus tools on these GitNexus development tasks. The MCP baseline
+receives only a per-cell Unix socket: its candidate runtime, shared package,
+registry, and host launcher are outside the agent filesystem. The host records
+`runtime_exposure: stdio-only` for this arm and `none` for the no-tool arm.
+Release and PR comparison validation reject missing or incompatible receipts.
+Older measurements exposed readable compiled runtime code, including later
+task implementations; they remain historical evidence and cannot satisfy this
+isolated comparison contract. Workflow/CLI arms retain their runtime mounts and
+are labeled `readable`.
+
+The [24 October evidence report](measurement-2026-10-24.md) retains the latest
+historical measurements, current tool-accuracy result, and post-merge rerun
+procedure. Those historical agent results do not show an accuracy or cost gain.
 
 This corpus uses a **fresh index at each task base**. A nightly stale Hermes
 index is a separate condition and must not be pooled with it. Import the
@@ -253,7 +262,9 @@ MCP configuration. Bash children do
 not inherit the model credential and their network sandbox denies all
 domains.
 
-The candidate MCP server runs in a separate nested Bubblewrap boundary. Its
+The release baseline's candidate MCP server runs in a sibling Bubblewrap
+boundary, reached by a stdio socket connector. Workflow/CLI arms retain a nested
+server boundary. In both cases its
 workspace (including the graph), registry, compiled runtime and shared package
 mounts are read-only. Its home and temporary directories are private tmpfs,
 and it has a fresh PID namespace and `/proc`, no network or capabilities, and
@@ -261,6 +272,13 @@ no model credentials or agent state. MCP startup and tool handlers therefore
 cannot write patches that would be credited to the agent; the agent retains
 its writable workspace for implementation tasks. Mutating MCP tools are not
 granted in any phase.
+
+The cell owns the socket listener and its servers through the existing managed
+process supervisor and an outer PID namespace. Each connection starts one
+server; reconnects are sequential. Server failures invalidate the cell, and
+teardown reaps detached descendants before removing the socket. Native canaries
+in `test_proposer_sandbox.py` run in the required Linux containment job; a local
+namespace skip does not prove isolation.
 
 Prebuilt task `.gitnexus` assets are rejected. For each task commit, the
 harness creates the deterministic parentless snapshot first, removes every
@@ -391,11 +409,11 @@ the paid job. Only these watchdogs have Actions write permission.
 The protected `gitnexus-evolution` environment holds these four settings
 (configured and verified by the live probes below):
 
-| Setting | Kind | Purpose |
-| --- | --- | --- |
-| `GITNEXUS_EVOLUTION_AWS_ROLE_ARN` | Secret | AWS role assumed through GitHub OIDC |
-| `GITNEXUS_EVOLUTION_EC2_INSTANCE_ID` | Secret | Dedicated runner instance |
-| `GITNEXUS_EVOLUTION_AWS_REGION` | Variable | Instance region |
+| Setting                                | Kind     | Purpose                                         |
+| -------------------------------------- | -------- | ----------------------------------------------- |
+| `GITNEXUS_EVOLUTION_AWS_ROLE_ARN`      | Secret   | AWS role assumed through GitHub OIDC            |
+| `GITNEXUS_EVOLUTION_EC2_INSTANCE_ID`   | Secret   | Dedicated runner instance                       |
+| `GITNEXUS_EVOLUTION_AWS_REGION`        | Variable | Instance region                                 |
 | `GITNEXUS_EVOLUTION_STOP_SCHEDULE_UTC` | Variable | Actual weekly EventBridge stop, `DAY HH:MM` UTC |
 
 No long-lived AWS credential is stored. The AWS action obtains short-lived
@@ -856,6 +874,25 @@ ingestion quality and are not comparable with the replacement task. The new
 task ID, prompt, verification command, and oracle bytes produce a new task
 digest. Old agent patches are not available for rescoring; keep historical
 measurements unchanged and compare only runs with matching task contracts.
+
+## MCP response cost
+
+With `include_content: true`, queries share a 16,000-character preview allowance
+equally across unique symbols on the returned page. The database returns only
+those prefixes, after ranking and pagination. `content_truncated: true` marks
+incomplete source; every match remains present. Use `context` for a full symbol
+or `read_file` for a bounded file range. This applies to CLI, HTTP, and MCP
+queries; group queries already request no source content.
+
+MCP query guidance lives in the JSON `next` field. Explicit `maxTokens` retains
+its existing final text cap, which can truncate JSON; it does not change the
+query preview allowance. Payload reductions alone do not establish agent cost
+or completion-time improvements: previews can require follow-up reads.
+
+MCP tool schemas expose the configured default repository name and path. The
+sandbox already configures `/workspace` as its default, so the schema identifies
+`benchmark-target` without adding benchmark-specific instructions to task prompts.
+Compare stable and candidate runtimes using the same harness revision.
 
 ## Relation to the SWE-bench harness
 
